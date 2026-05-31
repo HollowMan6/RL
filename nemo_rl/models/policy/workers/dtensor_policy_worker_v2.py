@@ -66,7 +66,10 @@ from nemo_rl.models.policy.interfaces import (
     LogprobOutputSpec,
     ScoreOutputSpec,
 )
-from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.utils import (
+    get_runtime_env_for_policy_worker,
+    maybe_preinit_nixl_for_checkpoint_engine,
+)
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
 from nemo_rl.models.policy.workers.patches import (
     apply_transformer_engine_patch,
@@ -229,6 +232,7 @@ class DTensorPolicyWorkerV2Impl(
 
         # Store configuration
         self.cfg = config
+        self._nixl_preinit_agent = maybe_preinit_nixl_for_checkpoint_engine(config)
 
         # Reconstruct tokenizer/processor locally to avoid pickling across
         # incompatible transformers versions (v4 head node → v5 worker).
@@ -999,6 +1003,31 @@ class DTensorPolicyWorkerV2Impl(
         # cpu offload needs model on CPU before model forward
         if self.cpu_offload:
             self.model = self.move_to_cpu(self.model)
+
+    @torch.no_grad()
+    def send_weights_via_checkpoint_engine(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Send model weights through the configured checkpoint engine."""
+        if kv_scales is not None:
+            raise NotImplementedError(
+                "FP8 kvcache is not currently supported for DTensor path, we will support it in the future."
+            )
+
+        if self.cpu_offload:
+            print(
+                "[WARNING]: Unless you are lacking of memory, it is not recommended to enable cpu_offload when "
+                "using non-colocated generation since it will have an extra onload and offload at refit stage."
+            )
+            self.model = self.move_to_cuda(self.model)
+
+        try:
+            self._send_weights_with_checkpoint_engine(
+                dtensor_params_generator(self.model, self.dtype)
+            )
+        finally:
+            if self.cpu_offload:
+                self.model = self.move_to_cpu(self.model)
 
     @wrap_with_nvtx_name("dtensor_policy_worker_v2/prepare_for_lp_inference")
     def prepare_for_lp_inference(self) -> None:

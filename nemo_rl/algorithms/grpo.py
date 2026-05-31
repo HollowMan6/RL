@@ -758,8 +758,12 @@ def setup(
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
+    checkpoint_engine_config = _get_enabled_checkpoint_engine_config(
+        generation_config.get("checkpoint_engine")
+    )
+
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and checkpoint_engine_config is None:
         t0 = time.perf_counter()
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
@@ -777,6 +781,11 @@ def setup(
         # wait for all futures to complete
         ray.get(futures_train + futures_inference)
         worker_init_timing_metrics["collective_init_time_s"] = time.perf_counter() - t0
+    elif not colocated_inference:
+        print(
+            f"Using checkpoint-engine refit backend: {checkpoint_engine_config['backend']}",
+            flush=True,
+        )
 
     # prepare refit info
     state_dict_info = policy.prepare_refit_info()
@@ -1170,6 +1179,89 @@ def _create_advantage_estimator(master_config: MasterConfig):
     return adv_estimator
 
 
+def _flatten_checkpoint_engine_metadata(metadata_results: list[Any]) -> list[Any]:
+    metadata = []
+    for worker_metadata in metadata_results:
+        if isinstance(worker_metadata, list):
+            metadata.extend(worker_metadata)
+        else:
+            metadata.append(worker_metadata)
+    return metadata
+
+
+def _get_enabled_checkpoint_engine_config(
+    checkpoint_engine_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if checkpoint_engine_config is None or not checkpoint_engine_config["enabled"]:
+        return None
+    return checkpoint_engine_config
+
+
+def _refit_policy_generation_with_checkpoint_engine(
+    policy: ColocatablePolicyInterface,
+    policy_generation: GenerationInterface,
+    checkpoint_engine_config: dict[str, Any],
+    kv_scales: Optional[dict[str, float]] = None,
+) -> bool:
+    backend = checkpoint_engine_config["backend"]
+    bucket_size_bytes = (
+        checkpoint_engine_config["update_weights_bucket_megabytes"] * 1024 * 1024
+    )
+    engine_kwargs = checkpoint_engine_config["engine_kwargs"][backend]
+
+    try:
+        init_futures = policy.init_checkpoint_engine(
+            backend=backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+        ) + policy_generation.init_checkpoint_engine(
+            backend=backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+        )
+        ray.get(init_futures)
+
+        policy_metadata = _flatten_checkpoint_engine_metadata(
+            ray.get(policy.prepare_checkpoint_engine())
+        )
+        generation_metadata = _flatten_checkpoint_engine_metadata(
+            ray.get(policy_generation.prepare_checkpoint_engine())
+        )
+
+        train_world_size = len(policy_metadata)
+        rollout_world_size = len(generation_metadata)
+        metadata = policy_metadata + generation_metadata
+        ray.get(
+            policy.init_checkpoint_engine_process_group(
+                metadata=metadata,
+                train_world_size=train_world_size,
+                rollout_world_size=rollout_world_size,
+            )
+            + policy_generation.init_checkpoint_engine_process_group(
+                metadata=metadata,
+                train_world_size=train_world_size,
+                rollout_world_size=rollout_world_size,
+            )
+        )
+
+        futures_train = policy.send_weights_via_checkpoint_engine(kv_scales=kv_scales)
+        futures_inference = policy_generation.update_weights_from_checkpoint_engine()
+        ray.get(futures_train)
+        results = ray.get(futures_inference)
+        return all(result for result in results if result is not None)
+    finally:
+        try:
+            ray.get(
+                policy.finalize_checkpoint_engine()
+                + policy_generation.finalize_checkpoint_engine()
+            )
+        except Exception as finalize_error:
+            warnings.warn(
+                f"Failed to finalize checkpoint-engine refit state: {finalize_error}",
+                RuntimeWarning,
+            )
+
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -1189,6 +1281,16 @@ def refit_policy_generation(
         timer: Optional Timer used to time the prepare/transfer/update phase
         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
     """
+    checkpoint_engine_config = _get_enabled_checkpoint_engine_config(
+        policy_generation.get_checkpoint_engine_config()
+    )
+    if colocated_inference and checkpoint_engine_config is not None:
+        raise ValueError(
+            "checkpoint-engine refit is only supported for non-colocated generation. "
+            "Set policy.generation.colocated.enabled=false or disable "
+            "policy.generation.checkpoint_engine.enabled."
+        )
+
     if colocated_inference:
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
@@ -1239,22 +1341,41 @@ def refit_policy_generation(
                 results = ray.get(futures_inference)
                 update_success = all(result for result in results if result is not None)
         else:
-            # update weights through nccl
-            # SGLang haven't implemented non-colocated inference mode.
-            if isinstance(policy_generation, SGLangGeneration):
-                raise NotImplementedError(
-                    "SGLang haven't implemented non-colocated inference mode. "
+            if checkpoint_engine_config is not None:
+                if isinstance(policy_generation, SGLangGeneration):
+                    raise NotImplementedError(
+                        "SGLang does not support checkpoint-engine non-colocated refit."
+                    )
+                update_success = _refit_policy_generation_with_checkpoint_engine(
+                    policy,
+                    policy_generation,
+                    checkpoint_engine_config,
+                    kv_scales=kv_scales,
                 )
-            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
-            futures_inference = policy_generation.update_weights_from_collective()
-            # wait for all futures to complete
-            ray.get(futures_train)
-            results = ray.get(futures_inference)
-            update_success = all(result for result in results if result is not None)
+            else:
+                # update weights through nccl
+                # SGLang haven't implemented non-colocated inference mode.
+                if isinstance(policy_generation, SGLangGeneration):
+                    raise NotImplementedError(
+                        "SGLang haven't implemented non-colocated inference mode. "
+                    )
+                futures_train = policy.broadcast_weights_for_collective(
+                    kv_scales=kv_scales
+                )
+                futures_inference = policy_generation.update_weights_from_collective()
+                # wait for all futures to complete
+                ray.get(futures_train)
+                results = ray.get(futures_inference)
+                update_success = all(result for result in results if result is not None)
 
         # check if update is successful
         if not update_success:
-            error_tag = "cuda-ipc" if colocated_inference else "nccl"
+            if colocated_inference:
+                error_tag = "cuda-ipc"
+            elif checkpoint_engine_config is not None:
+                error_tag = checkpoint_engine_config["backend"]
+            else:
+                error_tag = "nccl"
             error_message = (
                 "❌ Error: Updating weights for the generation policy failed during refit.\n"
                 f"This often indicates an issue with {error_tag} or "
@@ -2278,7 +2399,7 @@ def grpo_train(
                 .get("vllm_cfg", {})
                 .get("async_engine", False)
             ):
-                for metric_name in metrics.keys():
+                for metric_name in metrics:
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
                             metrics[metric_name],
@@ -2308,10 +2429,6 @@ def grpo_train(
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
 
-            number_of_samples_per_step = (
-                master_config.grpo["num_prompts_per_step"]
-                * master_config.grpo["num_generations_per_prompt"]
-            )
             total_num_gpus = (
                 master_config.cluster["num_nodes"]
                 * master_config.cluster["gpus_per_node"]
@@ -2738,7 +2855,7 @@ def async_grpo_train(
     )
 
     # Start trajectory collection in background
-    collection_task = trajectory_collector.start_collection.remote(dataloader)
+    trajectory_collector.start_collection.remote(dataloader)
 
     # Ensure collector knows initial weight version
     trajectory_collector.set_weight_version.remote(weight_version)
@@ -3366,7 +3483,7 @@ def async_grpo_train(
                 .get("vllm_cfg", {})
                 .get("async_engine", False)
             ):
-                for metric_name in metrics.keys():
+                for metric_name in metrics:
                     if metric_name.startswith("histogram/"):
                         logger.log_histogram(
                             metrics[metric_name],

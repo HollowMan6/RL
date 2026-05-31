@@ -34,6 +34,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 
@@ -145,6 +146,25 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
 
 
 class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
+    def __init__(
+        self,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]] = None,
+        fraction_of_gpus: float = 1.0,
+        seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
+    ):
+        self.server_thread: Optional[threading.Thread] = None
+        self.base_url: Optional[str] = None
+        self.http_server: Optional[uvicorn.Server] = None
+        super().__init__(
+            config=config,
+            bundle_indices=bundle_indices,
+            fraction_of_gpus=fraction_of_gpus,
+            seed=seed,
+            extra_env_vars=extra_env_vars,
+        )
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         from vllm.config import CompilationConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
@@ -182,7 +202,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        self.server_thread, self.base_url, self.http_server = None, None, None
         if self.cfg["vllm_cfg"].get("expose_http_server"):
             # Must run after AsyncLLM.from_engine_args and before
             # _setup_vllm_server spawns the uvicorn thread.
@@ -791,6 +810,55 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             ),
         )
 
+    async def _checkpoint_engine_rpc_async(self, method_name: str, *args: Any) -> Any:
+        result = await self.llm.collective_rpc(method_name, args=args)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+    async def init_checkpoint_engine_async(
+        self,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> None:
+        await self._checkpoint_engine_rpc_async(
+            "init_checkpoint_engine",
+            backend,
+            bucket_size_bytes,
+            engine_kwargs,
+        )
+
+    async def prepare_checkpoint_engine_async(self) -> list[Any]:
+        return cast(
+            list[Any],
+            await self._checkpoint_engine_rpc_async("prepare_checkpoint_engine"),
+        )
+
+    async def init_checkpoint_engine_process_group_async(
+        self,
+        rank_prefix: int,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> None:
+        await self._checkpoint_engine_rpc_async(
+            "init_checkpoint_engine_process_group",
+            rank_prefix,
+            train_world_size,
+            rollout_world_size,
+            metadata,
+        )
+
+    async def finalize_checkpoint_engine_async(self) -> None:
+        await self._checkpoint_engine_rpc_async("finalize_checkpoint_engine")
+
+    async def update_weights_from_checkpoint_engine_async(self) -> bool:
+        worker_results = await self._checkpoint_engine_rpc_async(
+            "update_weights_from_checkpoint_engine"
+        )
+        return all(result for result in worker_results if result is not None)
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -1306,13 +1374,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             torch.cuda.empty_cache()
 
             if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
+                assert self.http_server is not None
                 self.http_server.should_exit = True
                 self.server_thread.join()
 

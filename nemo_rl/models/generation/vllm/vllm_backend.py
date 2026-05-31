@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import gc
+import time
 import traceback
 from typing import Any
 
@@ -35,6 +37,27 @@ except ImportError:
         "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
         "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
     )
+
+
+def maybe_preinit_nixl_for_vllm_worker(
+    worker_wrapper: Any,
+    preinit_config: dict[str, Any],
+) -> None:
+    """Initialize NIXL in vLLM internal worker processes before vLLM setup."""
+    wrapper_state = vars(worker_wrapper)
+    if wrapper_state.get("_nrl_nixl_preinit_agent") is not None:
+        return
+
+    backend_name = preinit_config.get("backend_name", "UCX")
+    backend_init_params = preinit_config.get("backend_init_params")
+
+    from nemo_rl.utils.checkpoint_engines.nixl import preinit_nixl_agent
+
+    wrapper_state["_nrl_nixl_preinit_agent"] = preinit_nixl_agent(
+        backend_name=backend_name,
+        backend_init_params=backend_init_params,
+    )
+    print(f"NIXL vLLM worker preinit completed: backend={backend_name}", flush=True)
 
 
 def fix_gpt_oss_export_transpose(key: str, weight: torch.Tensor) -> torch.Tensor:
@@ -71,6 +94,52 @@ class VllmInternalWorkerExtension:
             master_address=ip, port=port, rank=rank, world_size=world_size
         )
         self.model_update_group.init_nccl_communicator(device=self.device)
+
+    def init_checkpoint_engine(
+        self,
+        backend: str,
+        bucket_size_bytes: int,
+        engine_kwargs: dict[str, Any],
+    ) -> None:
+        """Initialize checkpoint-engine based refit transfer."""
+        if getattr(self, "checkpoint_engine", None) is not None:
+            return
+
+        from nemo_rl.utils.checkpoint_engine import create_checkpoint_engine
+
+        self.checkpoint_engine = create_checkpoint_engine(
+            backend,
+            bucket_size_bytes=bucket_size_bytes,
+            engine_kwargs=engine_kwargs,
+            default_device=self.device,
+        )
+
+    def prepare_checkpoint_engine(self) -> Any:
+        """Prepare transfer buffers and return checkpoint-engine metadata."""
+        return self.checkpoint_engine.prepare()
+
+    def init_checkpoint_engine_process_group(
+        self,
+        rank_prefix: int,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> None:
+        """Connect this vLLM worker into the checkpoint-engine topology."""
+        local_rank = torch.distributed.get_rank()
+        self.checkpoint_engine.init_rollout_process_group(
+            rollout_rank=rank_prefix + local_rank,
+            train_world_size=train_world_size,
+            rollout_world_size=rollout_world_size,
+            metadata=metadata,
+        )
+
+    def finalize_checkpoint_engine(self) -> None:
+        """Release checkpoint-engine transfer state."""
+        checkpoint_engine = getattr(self, "checkpoint_engine", None)
+        if checkpoint_engine is None:
+            return
+        checkpoint_engine.finalize()
 
     def report_device_id(self) -> str:
         """Retrieve the UUID of the current CUDA device."""
@@ -327,6 +396,71 @@ class VllmInternalWorkerExtension:
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
+                f"{traceback.format_exc()}"
+            )
+            return False
+
+    async def _update_weights_from_checkpoint_engine_async(self) -> bool:
+        loaded_tensors = 0
+        loaded_bytes = 0
+        loaded_batches = 0
+        load_time = 0.0
+        sync_time = 0.0
+        cleanup_time = 0.0
+        start_time = time.time()
+
+        async for weight_batch in self.checkpoint_engine.receive_weight_batches():
+            loaded_batches += 1
+            loaded_tensors += len(weight_batch)
+            loaded_bytes += sum(weight.nbytes for _name, weight in weight_batch)
+
+            load_start = time.time()
+            self._load_weights(weight_batch)
+            load_time += time.time() - load_start
+
+            sync_start = time.time()
+            torch.cuda.current_stream().synchronize()
+            sync_time += time.time() - sync_start
+            del weight_batch
+
+        postprocess_start = time.time()
+        self._maybe_process_fp8_kv_cache()
+        postprocess_time = time.time() - postprocess_start
+
+        if self.checkpoint_engine.cleanup_after_load:
+            cleanup_start = time.time()
+            gc.collect()
+            torch.cuda.empty_cache()
+            cleanup_time = time.time() - cleanup_start
+
+        total_time = time.time() - start_time
+        receive_time = max(
+            total_time - load_time - sync_time - postprocess_time - cleanup_time,
+            0.0,
+        )
+        loaded_gib = loaded_bytes / (1024 * 1024 * 1024)
+        print(
+            "[vLLM refit] Loaded "
+            f"{loaded_tensors} tensors in {loaded_batches} batches via checkpoint "
+            f"engine; bytes={loaded_gib:.2f}GiB total={total_time:.2f}s "
+            f"receive={receive_time:.2f}s load={load_time:.2f}s "
+            f"sync={sync_time:.2f}s postprocess={postprocess_time:.2f}s "
+            f"cleanup={cleanup_time:.2f}s"
+        )
+        return True
+
+    @wrap_with_nvtx_name(
+        "vllm_internal_worker_extension/update_weights_from_checkpoint_engine"
+    )
+    def update_weights_from_checkpoint_engine(self) -> bool:
+        """Receive and update model weights through a checkpoint engine."""
+        try:
+            return asyncio.run(self._update_weights_from_checkpoint_engine_async())
+        except Exception as e:
+            print(
+                "Error in "
+                "VllmInternalWorkerExtension.update_weights_from_checkpoint_engine: "
+                f"{e}.\n"
                 f"{traceback.format_exc()}"
             )
             return False

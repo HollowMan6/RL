@@ -114,6 +114,13 @@ Create custom reward environments and integrate them with NeMo RL training pipel
 Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
 :::
 
+:::{grid-item-card} {octicon}`workflow` Checkpoint-Engine Refit
+:link: guides/checkpoint-engine-refit
+:link-type: doc
+
+Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy weights.
+:::
+
 :::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
 :link: guides/grpo-audio
 :link-type: doc
@@ -147,6 +154,13 @@ Extend a model's context window with YaRN RoPE scaling on the Megatron backend f
 :link-type: doc
 
 Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
+:::
+
+:::{grid-item-card} {octicon}`package` Checkpoint Engines
+:link: design-docs/checkpoint-engines
+:link-type: doc
+
+Understand the checkpoint-engine refit interface and how to add new transfer backends.
 :::
 
 :::{grid-item-card} {octicon}`bug` Debugging
@@ -250,6 +264,7 @@ model-quirks.md
 guides/async-grpo.md
 guides/quantization-aware-rl.md
 guides/eagle3-speculative-decoding.md
+guides/checkpoint-engine-refit.md
 guides/yarn-long-context.md
 guides/muon-optimizer.md
 guides/dtensor-tp-accuracy.md
@@ -288,6 +303,7 @@ design-docs/dependency-management.md
 design-docs/chat-datasets.md
 design-docs/generation.md
 design-docs/checkpointing.md
+design-docs/checkpoint-engines.md
 design-docs/loss-functions.md
 design-docs/fsdp2-parallel-plan.md
 design-docs/training-backends.md
