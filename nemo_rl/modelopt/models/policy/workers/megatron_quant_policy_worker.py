@@ -326,27 +326,20 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
     def _iter_real_quant_refit_params(self, kv_scales=None):
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
-        from nemo_rl.modelopt.models.policy.workers.qat_weight_exporter import (
-            QATWeightExporter,
-        )
         from nemo_rl.modelopt.utils import build_vllm_modelopt_nvfp4_config
 
-        base_iter = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,
-        )
         generation_cfg = self.cfg.get("generation") or {}
         vllm_cfg = generation_cfg.get("vllm_cfg", {})
         ignore = generation_cfg.get("real_quant_ignore")
         if ignore is None:
             ignore = build_vllm_modelopt_nvfp4_config()["ignore"]
-        exporter = QATWeightExporter(
+        yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
-            self.megatron_bridge,
+            quant_mode="nvfp4",
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,
             ignore_patterns=ignore,
         )
-        yield from exporter.process_weights_iterator(base_iter)
 
         if self.draft_model is not None:
             from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
@@ -354,10 +347,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for name, tensor in export_eagle_weights_to_hf(self.draft_model):
                 yield f"draft.{name}", tensor
 
-        use_fp8_kv_cache = "kv_cache_dtype" in vllm_cfg and vllm_cfg[
-            "kv_cache_dtype"
-        ].startswith("fp8")
-        if not use_fp8_kv_cache:
+        if not vllm_cfg.get("kv_cache_dtype", "").startswith("fp8"):
             return
 
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (

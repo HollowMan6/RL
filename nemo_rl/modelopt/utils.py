@@ -28,26 +28,29 @@ _QUANT_IGNORE_NAME_SUFFIXES = (
 
 def iter_quant_ignore_name_candidates(name: str) -> Iterator[str]:
     """Yield name variants matched by ModelOpt real-quant ignore patterns."""
-    candidates = [name]
-    if name.startswith("model."):
-        candidates.append(name.removeprefix("model."))
-    else:
-        candidates.append(f"model.{name}")
+    yield name
+    for suffix in _QUANT_IGNORE_NAME_SUFFIXES:
+        if name.endswith(suffix):
+            yield name[: -len(suffix)]
+            break
 
-    for candidate in candidates:
-        yield candidate
-        for suffix in _QUANT_IGNORE_NAME_SUFFIXES:
-            if candidate.endswith(suffix):
-                yield candidate[: -len(suffix)]
-                break
+    alternate = name.removeprefix("model.") if name.startswith("model.") else f"model.{name}"
+    if alternate == name:
+        return
+
+    yield alternate
+    for suffix in _QUANT_IGNORE_NAME_SUFFIXES:
+        if alternate.endswith(suffix):
+            yield alternate[: -len(suffix)]
+            break
 
 
 def matches_quant_ignore_pattern(name: str, patterns: list[str]) -> bool:
     """Return whether ``name`` matches any ModelOpt real-quant ignore pattern."""
     return any(
         fnmatchcase(candidate, pattern)
-        for pattern in patterns
         for candidate in iter_quant_ignore_name_candidates(name)
+        for pattern in patterns
     )
 
 

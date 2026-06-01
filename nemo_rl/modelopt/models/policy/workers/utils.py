@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.training.config import target_allowlist
 from modelopt.torch.quantization.config import normalize_quant_cfg_list
 from modelopt.torch.utils.dataset_utils import (
     create_forward_loop,
@@ -256,3 +257,8 @@ def quantization_layer_spec(config):
         real_quant_cfg="None",
         use_arbitrary_attention_mask=False,
     )
+
+
+target_allowlist.add_exact(
+    "nemo_rl.modelopt.models.policy.workers.utils.quantization_layer_spec"
+)
